@@ -215,19 +215,19 @@ def _version_newer(latest: str, current: str) -> bool:
 
 
 def check_for_update() -> tuple[str, str] | None:
-    """Query GitHub releases API. Returns (version, download_url) if newer, else None."""
+    """Query GitHub releases API. Returns (version, download_url) if newer, else None.
+    Raises on network / API errors so callers can distinguish from 'already up to date'."""
     url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        latest = data["tag_name"].lstrip("v")
-        if _version_newer(latest, VERSION):
-            for asset in data.get("assets", []):
-                if asset["name"].endswith(".exe"):
-                    return latest, asset["browser_download_url"]
-    except Exception as exc:
-        logging.warning("update check failed: %s", exc)
+    req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+    latest = data["tag_name"].lstrip("v")
+    logging.info("update check: installed=%s latest=%s", VERSION, latest)
+    if _version_newer(latest, VERSION):
+        for asset in data.get("assets", []):
+            if asset["name"].endswith(".exe"):
+                return latest, asset["browser_download_url"]
+        raise RuntimeError(f"v{latest} has no .exe asset on the release")
     return None
 
 
@@ -681,7 +681,13 @@ class TrayApp:
         ).start()
 
     def _run_update_check(self, manual: bool = False) -> None:
-        result = check_for_update()
+        try:
+            result = check_for_update()
+        except Exception as exc:
+            logging.warning("update check failed: %s", exc)
+            if manual:
+                self._show_notification(APP_NAME, f"Update check failed: {exc}")
+            return
         if result:
             new_version, download_url = result
             self._pending_update = result
