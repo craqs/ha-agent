@@ -447,6 +447,7 @@ _DISCOVERY_CONFIGS: list[tuple[str, dict]] = [
             "name": "Notify",
             "unique_id": f"{HOSTNAME}_notify",
             "command_topic": NOTIFY_TOPIC,
+            "command_template": '{{ {"title": title, "message": message} | to_json }}',
         },
     ),
     (
@@ -594,7 +595,7 @@ class MQTTAgent:
                 # HA notify.send_message publishes a plain string; direct mqtt.publish may
                 # send JSON — handle both gracefully.
                 payload = json.loads(raw)
-                title = str(payload.get("title", APP_NAME))
+                title = str(payload.get("title") or APP_NAME)
                 message = str(payload.get("message", raw))
             except (json.JSONDecodeError, AttributeError):
                 title = APP_NAME
