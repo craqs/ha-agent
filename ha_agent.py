@@ -398,7 +398,7 @@ _DISCOVERY_CONFIGS: list[tuple[str, dict]] = [
         f"homeassistant/device_tracker/ha_agent_{HOSTNAME}/config",
         {
             **_AVAIL_FRAGMENT,
-            "name": f"{HOSTNAME} PC",
+            "name": "PC",
             "unique_id": f"{HOSTNAME}_pc",
             "state_topic": STATUS_TOPIC,
             "payload_home": "home",
@@ -410,7 +410,7 @@ _DISCOVERY_CONFIGS: list[tuple[str, dict]] = [
         f"homeassistant/notify/ha_agent_{HOSTNAME}/config",
         {
             **_AVAIL_FRAGMENT,
-            "name": f"{HOSTNAME} Notify",
+            "name": "Notify",
             "unique_id": f"{HOSTNAME}_notify",
             "command_topic": NOTIFY_TOPIC,
         },
@@ -443,13 +443,12 @@ _DISCOVERY_CONFIGS: list[tuple[str, dict]] = [
             **_AVAIL_FRAGMENT,
             "name": "HA Agent",
             "unique_id": f"{HOSTNAME}_update",
+            # state_topic carries the installed version string; HA derives on/off by
+            # comparing it against latest_version_topic — do NOT use payload_on/off here.
             "state_topic": UPDATE_STATE_TOPIC,
-            "payload_on": "ON",
-            "payload_off": "OFF",
             "latest_version_topic": UPDATE_LATEST_TOPIC,
             "command_topic": UPDATE_INSTALL_TOPIC,
             "payload_install": "install",
-            "current_version": VERSION,
             "device_class": "firmware",
             "entity_picture": "https://brands.home-assistant.io/_/mqtt/icon.png",
         },
@@ -525,10 +524,10 @@ class MQTTAgent:
             logging.info("MQTT connected to %s", self._config.get("mqtt_host"))
             self._publish_discovery()
             client.publish(AVAIL_TOPIC, "online", retain=True)
-            client.publish(STATUS_TOPIC, "home")
+            client.publish(STATUS_TOPIC, "home", retain=True)
             client.publish(VERSION_TOPIC, VERSION, retain=True)
-            client.publish(UPDATE_STATE_TOPIC, "OFF", retain=True)
-            client.publish(UPDATE_LATEST_TOPIC, VERSION, retain=True)
+            client.publish(UPDATE_STATE_TOPIC, VERSION, retain=True)   # installed version
+            client.publish(UPDATE_LATEST_TOPIC, VERSION, retain=True)  # start equal = no update
             client.subscribe(NOTIFY_TOPIC)
             client.subscribe(UPDATE_INSTALL_TOPIC)
             client.subscribe(UPDATE_CHECK_TOPIC)
@@ -542,13 +541,16 @@ class MQTTAgent:
 
     def _on_message(self, client, userdata, msg) -> None:
         if msg.topic == NOTIFY_TOPIC and self._notify_callback:
+            raw = msg.payload.decode()
             try:
-                payload = json.loads(msg.payload.decode())
-            except Exception:
-                logging.warning("notify: could not parse payload: %r", msg.payload)
-                return
-            title = str(payload.get("title", APP_NAME))
-            message = str(payload.get("message", ""))
+                # HA notify.send_message publishes a plain string; direct mqtt.publish may
+                # send JSON — handle both gracefully.
+                payload = json.loads(raw)
+                title = str(payload.get("title", APP_NAME))
+                message = str(payload.get("message", raw))
+            except (json.JSONDecodeError, AttributeError):
+                title = APP_NAME
+                message = raw
             if message:
                 logging.info("notify: %s — %s", title, message)
                 self._notify_callback(title, message)
@@ -563,7 +565,7 @@ class MQTTAgent:
 
     def publish_update_status(self, latest_version: str, available: bool) -> None:
         if self._connected and self._client:
-            self._client.publish(UPDATE_STATE_TOPIC, "ON" if available else "OFF", retain=True)
+            # state_topic always holds the installed version; HA infers on/off from the diff.
             self._client.publish(UPDATE_LATEST_TOPIC, latest_version, retain=True)
 
     def _publish_discovery(self) -> None:
