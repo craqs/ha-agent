@@ -488,11 +488,12 @@ _DISCOVERY_CONFIGS: list[tuple[str, dict]] = [
 
 
 class MQTTAgent:
-    def __init__(self, config: dict, notify_callback=None, install_callback=None, check_callback=None) -> None:
+    def __init__(self, config: dict, notify_callback=None, install_callback=None, check_callback=None, status_callback=None) -> None:
         self._config = config
         self._notify_callback = notify_callback    # callable(title, message)
         self._install_callback = install_callback  # callable() — HA pressed Install
         self._check_callback = check_callback      # callable() — HA pressed Check for Update
+        self._status_callback = status_callback    # callable(connected: bool)
         self._camera: bool | None = None
         self._mic: bool | None = None
         self._connected = False
@@ -561,6 +562,8 @@ class MQTTAgent:
     def _on_connect(self, client, userdata, flags, rc) -> None:
         if rc == 0:
             self._connected = True
+            if self._status_callback:
+                self._status_callback(True)
             logging.info("MQTT connected to %s", self._config.get("mqtt_host"))
             self._publish_discovery()
             client.publish(AVAIL_TOPIC, "online", retain=True)
@@ -576,6 +579,8 @@ class MQTTAgent:
 
     def _on_disconnect(self, client, userdata, rc) -> None:
         self._connected = False
+        if self._status_callback:
+            self._status_callback(False)
         if rc != 0:
             logging.warning("MQTT disconnected unexpectedly (rc=%d)", rc)
 
@@ -637,10 +642,25 @@ class MQTTAgent:
 # ── System tray ───────────────────────────────────────────────────────────────
 
 
-def _make_tray_icon(connected: bool = True) -> Image.Image:
-    color = (34, 139, 34) if connected else (180, 40, 40)
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    ImageDraw.Draw(img).ellipse((4, 4, 60, 60), fill=color)
+def _make_tray_icon(connected: bool) -> Image.Image:
+    SIZE = 64
+    HA_BLUE = (24, 188, 242)
+    img = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    # HA-blue background circle
+    d.ellipse((0, 0, SIZE - 1, SIZE - 1), fill=HA_BLUE)
+
+    # House silhouette (white), shifted slightly upper-left so dot fits bottom-right
+    d.polygon([(28, 10), (8, 30), (48, 30)], fill="white")   # roof
+    d.rectangle([14, 28, 42, 46], fill="white")               # body
+    d.rectangle([24, 36, 32, 46], fill=HA_BLUE)               # door cutout
+
+    # Status dot — green = connected, red = disconnected
+    dot_color = (34, 197, 94) if connected else (239, 68, 68)
+    d.ellipse((40, 40, 62, 62), fill="white")   # white ring
+    d.ellipse((43, 43, 59, 59), fill=dot_color)
+
     return img
 
 
@@ -654,13 +674,14 @@ class TrayApp:
             notify_callback=self._show_notification,
             install_callback=self._handle_ha_install,
             check_callback=lambda: self._run_update_check(manual=True),
+            status_callback=self._on_connection_status,
         )
 
     def run(self) -> None:
         self._agent.start()
         self._icon = pystray.Icon(
             APP_NAME,
-            _make_tray_icon(),
+            _make_tray_icon(connected=False),
             APP_NAME,
             self._build_menu(),
         )
@@ -678,7 +699,16 @@ class TrayApp:
             pystray.MenuItem("Exit", self._exit),
         )
 
+    def _on_connection_status(self, connected: bool) -> None:
+        if self._icon:
+            self._icon.icon = _make_tray_icon(connected)
+
     def _show_status(self, icon, item) -> None:
+        # Run in its own thread — calling MessageBoxW from pystray's Win32 callback
+        # can prevent the window from receiving input focus.
+        threading.Thread(target=self._do_show_status, daemon=True).start()
+
+    def _do_show_status(self) -> None:
         import ctypes
         ctypes.windll.user32.MessageBoxW(0, self._agent.status_text, APP_NAME, 0x40)
 
@@ -695,6 +725,7 @@ class TrayApp:
                 notify_callback=self._show_notification,
                 install_callback=self._handle_ha_install,
                 check_callback=lambda: self._run_update_check(manual=True),
+                status_callback=self._on_connection_status,
             )
             self._agent.start()
 
