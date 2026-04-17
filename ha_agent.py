@@ -472,7 +472,16 @@ class MQTTAgent:
 
     def start(self) -> None:
         self._stop.clear()
-        client = mqtt.Client(client_id=f"ha-agent-{HOSTNAME}", clean_session=True)
+        # paho-mqtt 2.x requires CallbackAPIVersion to avoid broken on_message dispatch.
+        try:
+            client = mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
+                client_id=f"ha-agent-{HOSTNAME}",
+                clean_session=True,
+            )
+        except (AttributeError, TypeError):
+            # paho-mqtt 1.x — no CallbackAPIVersion
+            client = mqtt.Client(client_id=f"ha-agent-{HOSTNAME}", clean_session=True)
         if self._config.get("mqtt_user"):
             client.username_pw_set(
                 self._config["mqtt_user"], self._config.get("mqtt_password", "")
@@ -725,8 +734,14 @@ class TrayApp:
             self._show_notification(APP_NAME, f"Update failed: {exc}")
 
     def _exit(self, icon, item) -> None:
+        # Must run outside the menu callback thread; calling icon.stop() from within
+        # the Win32 message pump callback causes a deadlock in pystray.
+        threading.Thread(target=self._do_exit, daemon=True).start()
+
+    def _do_exit(self) -> None:
         self._agent.stop()
-        icon.stop()
+        if self._icon:
+            self._icon.stop()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
