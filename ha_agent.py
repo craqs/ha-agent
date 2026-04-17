@@ -48,6 +48,10 @@ CAMERA_TOPIC = f"ha_agent/{HOSTNAME}/camera"
 MIC_TOPIC = f"ha_agent/{HOSTNAME}/microphone"
 STATUS_TOPIC = f"ha_agent/{HOSTNAME}/status"
 NOTIFY_TOPIC = f"ha_agent/{HOSTNAME}/notify"
+VERSION_TOPIC = f"ha_agent/{HOSTNAME}/version"
+UPDATE_STATE_TOPIC = f"ha_agent/{HOSTNAME}/update/state"    # "ON" = update available
+UPDATE_LATEST_TOPIC = f"ha_agent/{HOSTNAME}/update/latest"  # latest version string
+UPDATE_INSTALL_TOPIC = f"ha_agent/{HOSTNAME}/update/install"  # receives "install" from HA
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -410,13 +414,41 @@ _DISCOVERY_CONFIGS: list[tuple[str, dict]] = [
             "command_topic": NOTIFY_TOPIC,
         },
     ),
+    (
+        f"homeassistant/sensor/ha_agent_{HOSTNAME}/version/config",
+        {
+            **_AVAIL_FRAGMENT,
+            "name": "Agent Version",
+            "unique_id": f"{HOSTNAME}_version",
+            "state_topic": VERSION_TOPIC,
+            "icon": "mdi:tag",
+        },
+    ),
+    (
+        f"homeassistant/update/ha_agent_{HOSTNAME}/config",
+        {
+            **_AVAIL_FRAGMENT,
+            "name": "HA Agent",
+            "unique_id": f"{HOSTNAME}_update",
+            "state_topic": UPDATE_STATE_TOPIC,
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "latest_version_topic": UPDATE_LATEST_TOPIC,
+            "command_topic": UPDATE_INSTALL_TOPIC,
+            "payload_install": "install",
+            "current_version": VERSION,
+            "device_class": "firmware",
+            "entity_picture": "https://brands.home-assistant.io/_/mqtt/icon.png",
+        },
+    ),
 ]
 
 
 class MQTTAgent:
-    def __init__(self, config: dict, notify_callback=None) -> None:
+    def __init__(self, config: dict, notify_callback=None, install_callback=None) -> None:
         self._config = config
-        self._notify_callback = notify_callback  # callable(title, message)
+        self._notify_callback = notify_callback    # callable(title, message)
+        self._install_callback = install_callback  # callable() — HA pressed Install
         self._camera: bool | None = None
         self._mic: bool | None = None
         self._connected = False
@@ -480,7 +512,11 @@ class MQTTAgent:
             self._publish_discovery()
             client.publish(AVAIL_TOPIC, "online", retain=True)
             client.publish(STATUS_TOPIC, "home")
+            client.publish(VERSION_TOPIC, VERSION, retain=True)
+            client.publish(UPDATE_STATE_TOPIC, "OFF", retain=True)
+            client.publish(UPDATE_LATEST_TOPIC, VERSION, retain=True)
             client.subscribe(NOTIFY_TOPIC)
+            client.subscribe(UPDATE_INSTALL_TOPIC)
         else:
             logging.error("MQTT connection refused (rc=%d)", rc)
 
@@ -490,18 +526,26 @@ class MQTTAgent:
             logging.warning("MQTT disconnected unexpectedly (rc=%d)", rc)
 
     def _on_message(self, client, userdata, msg) -> None:
-        if msg.topic != NOTIFY_TOPIC or not self._notify_callback:
-            return
-        try:
-            payload = json.loads(msg.payload.decode())
-        except Exception:
-            logging.warning("notify: could not parse payload: %r", msg.payload)
-            return
-        title = str(payload.get("title", APP_NAME))
-        message = str(payload.get("message", ""))
-        if message:
-            logging.info("notify: %s — %s", title, message)
-            self._notify_callback(title, message)
+        if msg.topic == NOTIFY_TOPIC and self._notify_callback:
+            try:
+                payload = json.loads(msg.payload.decode())
+            except Exception:
+                logging.warning("notify: could not parse payload: %r", msg.payload)
+                return
+            title = str(payload.get("title", APP_NAME))
+            message = str(payload.get("message", ""))
+            if message:
+                logging.info("notify: %s — %s", title, message)
+                self._notify_callback(title, message)
+
+        elif msg.topic == UPDATE_INSTALL_TOPIC and self._install_callback:
+            logging.info("update install requested from HA")
+            threading.Thread(target=self._install_callback, daemon=True).start()
+
+    def publish_update_status(self, latest_version: str, available: bool) -> None:
+        if self._connected and self._client:
+            self._client.publish(UPDATE_STATE_TOPIC, "ON" if available else "OFF", retain=True)
+            self._client.publish(UPDATE_LATEST_TOPIC, latest_version, retain=True)
 
     def _publish_discovery(self) -> None:
         for topic, payload in _DISCOVERY_CONFIGS:
@@ -543,7 +587,12 @@ class TrayApp:
     def __init__(self, config: dict) -> None:
         self._config = config
         self._icon: pystray.Icon | None = None
-        self._agent = MQTTAgent(config, notify_callback=self._show_notification)
+        self._pending_update: tuple[str, str] | None = None  # (version, download_url)
+        self._agent = MQTTAgent(
+            config,
+            notify_callback=self._show_notification,
+            install_callback=self._handle_ha_install,
+        )
 
     def run(self) -> None:
         self._agent.start()
@@ -579,7 +628,11 @@ class TrayApp:
         def on_save(new_config: dict) -> None:
             self._config = new_config
             self._agent.stop()
-            self._agent = MQTTAgent(new_config, notify_callback=self._show_notification)
+            self._agent = MQTTAgent(
+                new_config,
+                notify_callback=self._show_notification,
+                install_callback=self._handle_ha_install,
+            )
             self._agent.start()
 
         threading.Thread(
@@ -599,10 +652,24 @@ class TrayApp:
         result = check_for_update()
         if result:
             new_version, download_url = result
+            self._pending_update = result
+            self._agent.publish_update_status(new_version, available=True)
             self._show_notification(APP_NAME, f"Update v{new_version} found, downloading…")
             self._do_update(new_version, download_url)
-        elif manual:
-            self._show_notification(APP_NAME, f"Already on the latest version ({VERSION}).")
+        else:
+            self._pending_update = None
+            self._agent.publish_update_status(VERSION, available=False)
+            if manual:
+                self._show_notification(APP_NAME, f"Already on the latest version ({VERSION}).")
+
+    def _handle_ha_install(self) -> None:
+        if self._pending_update:
+            new_version, download_url = self._pending_update
+            self._show_notification(APP_NAME, f"Installing v{new_version} as requested by HA…")
+            self._do_update(new_version, download_url)
+        else:
+            # Re-check in case state is stale (e.g. agent was just started)
+            self._run_update_check(manual=True)
 
     def _do_update(self, new_version: str, download_url: str) -> None:
         if not getattr(sys, "frozen", False):
