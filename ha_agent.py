@@ -52,6 +52,7 @@ VERSION_TOPIC = f"ha_agent/{HOSTNAME}/version"
 UPDATE_STATE_TOPIC = f"ha_agent/{HOSTNAME}/update/state"    # "ON" = update available
 UPDATE_LATEST_TOPIC = f"ha_agent/{HOSTNAME}/update/latest"  # latest version string
 UPDATE_INSTALL_TOPIC = f"ha_agent/{HOSTNAME}/update/install"  # receives "install" from HA
+UPDATE_CHECK_TOPIC = f"ha_agent/{HOSTNAME}/update/check"    # receives "check" to force re-check
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -415,6 +416,18 @@ _DISCOVERY_CONFIGS: list[tuple[str, dict]] = [
         },
     ),
     (
+        f"homeassistant/button/ha_agent_{HOSTNAME}/check_update/config",
+        {
+            **_AVAIL_FRAGMENT,
+            "name": "Check for Update",
+            "unique_id": f"{HOSTNAME}_check_update",
+            "command_topic": UPDATE_CHECK_TOPIC,
+            "payload_press": "check",
+            "device_class": "update",
+            "icon": "mdi:cloud-search",
+        },
+    ),
+    (
         f"homeassistant/sensor/ha_agent_{HOSTNAME}/version/config",
         {
             **_AVAIL_FRAGMENT,
@@ -445,10 +458,11 @@ _DISCOVERY_CONFIGS: list[tuple[str, dict]] = [
 
 
 class MQTTAgent:
-    def __init__(self, config: dict, notify_callback=None, install_callback=None) -> None:
+    def __init__(self, config: dict, notify_callback=None, install_callback=None, check_callback=None) -> None:
         self._config = config
         self._notify_callback = notify_callback    # callable(title, message)
         self._install_callback = install_callback  # callable() — HA pressed Install
+        self._check_callback = check_callback      # callable() — HA pressed Check for Update
         self._camera: bool | None = None
         self._mic: bool | None = None
         self._connected = False
@@ -517,6 +531,7 @@ class MQTTAgent:
             client.publish(UPDATE_LATEST_TOPIC, VERSION, retain=True)
             client.subscribe(NOTIFY_TOPIC)
             client.subscribe(UPDATE_INSTALL_TOPIC)
+            client.subscribe(UPDATE_CHECK_TOPIC)
         else:
             logging.error("MQTT connection refused (rc=%d)", rc)
 
@@ -541,6 +556,10 @@ class MQTTAgent:
         elif msg.topic == UPDATE_INSTALL_TOPIC and self._install_callback:
             logging.info("update install requested from HA")
             threading.Thread(target=self._install_callback, daemon=True).start()
+
+        elif msg.topic == UPDATE_CHECK_TOPIC and self._check_callback:
+            logging.info("update check requested from HA")
+            threading.Thread(target=self._check_callback, daemon=True).start()
 
     def publish_update_status(self, latest_version: str, available: bool) -> None:
         if self._connected and self._client:
@@ -592,6 +611,7 @@ class TrayApp:
             config,
             notify_callback=self._show_notification,
             install_callback=self._handle_ha_install,
+            check_callback=lambda: self._run_update_check(manual=True),
         )
 
     def run(self) -> None:
@@ -632,6 +652,7 @@ class TrayApp:
                 new_config,
                 notify_callback=self._show_notification,
                 install_callback=self._handle_ha_install,
+                check_callback=lambda: self._run_update_check(manual=True),
             )
             self._agent.start()
 
