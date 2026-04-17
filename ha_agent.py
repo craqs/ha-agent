@@ -231,6 +231,37 @@ def check_for_update() -> tuple[str, str] | None:
     return None
 
 
+def ensure_single_instance() -> None:
+    """Kill any other ha-agent.exe process already running on this machine."""
+    if not getattr(sys, "frozen", False):
+        return  # running as script — skip
+    my_pid = os.getpid()
+    killed = False
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq ha-agent.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().splitlines():
+            parts = [p.strip('"') for p in line.split('","')]
+            if len(parts) >= 2:
+                try:
+                    pid = int(parts[1])
+                    if pid != my_pid:
+                        subprocess.run(
+                            ["taskkill", "/F", "/PID", str(pid)],
+                            capture_output=True, timeout=5,
+                        )
+                        logging.info("killed previous ha-agent instance (PID %d)", pid)
+                        killed = True
+                except ValueError:
+                    pass
+    except Exception as exc:
+        logging.warning("single-instance check failed: %s", exc)
+    if killed:
+        time.sleep(0.5)  # let killed process release MQTT/tray resources
+
+
 def cleanup_old_exe() -> None:
     """Remove ha-agent-old.exe left behind by a previous self-update."""
     if not getattr(sys, "frozen", False):
@@ -760,6 +791,7 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
+    ensure_single_instance()
     cleanup_old_exe()
 
     parser = argparse.ArgumentParser(description=APP_NAME)
