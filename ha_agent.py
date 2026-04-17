@@ -24,6 +24,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+import ssl
+import certifi
 import paho.mqtt.client as mqtt
 from PIL import Image, ImageDraw
 import pystray
@@ -219,7 +221,8 @@ def check_for_update() -> tuple[str, str] | None:
     Raises on network / API errors so callers can distinguish from 'already up to date'."""
     url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
     req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
         data = json.loads(resp.read())
     latest = data["tag_name"].lstrip("v")
     logging.info("update check: installed=%s latest=%s", VERSION, latest)

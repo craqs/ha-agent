@@ -49,6 +49,8 @@ jobs:
           --hidden-import=zeroconf._handlers.record_manager
           --hidden-import=paho.mqtt.client
           --hidden-import=pystray._win32
+          --hidden-import=certifi
+          --collect-data=certifi
           ha_agent.py
 
       - name: Upload artifact
