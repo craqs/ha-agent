@@ -17,9 +17,11 @@ import json
 import logging
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
@@ -35,6 +37,8 @@ from tkinter import ttk, messagebox
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 APP_NAME = "HA-Agent"
+VERSION = "0.0.0"  # patched to the git tag by the GitHub Actions workflow before building
+GITHUB_REPO = "craqs/ha-agent"
 POLL_INTERVAL = 5  # seconds between sensor polls
 
 HOSTNAME = socket.gethostname().replace(" ", "_")
@@ -191,6 +195,48 @@ def discover_mqtt_broker(timeout: float = 5.0) -> tuple[str, int] | None:
     time.sleep(timeout)
     zc.close()
     return found[0] if found else None
+
+
+# ── Auto-update ───────────────────────────────────────────────────────────────
+
+
+def _version_newer(latest: str, current: str) -> bool:
+    def parse(v: str):
+        return tuple(int(x) for x in v.strip().split("."))
+    try:
+        return parse(latest) > parse(current)
+    except Exception:
+        return False
+
+
+def check_for_update() -> tuple[str, str] | None:
+    """Query GitHub releases API. Returns (version, download_url) if newer, else None."""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        latest = data["tag_name"].lstrip("v")
+        if _version_newer(latest, VERSION):
+            for asset in data.get("assets", []):
+                if asset["name"].endswith(".exe"):
+                    return latest, asset["browser_download_url"]
+    except Exception as exc:
+        logging.warning("update check failed: %s", exc)
+    return None
+
+
+def cleanup_old_exe() -> None:
+    """Remove ha-agent-old.exe left behind by a previous self-update."""
+    if not getattr(sys, "frozen", False):
+        return
+    old = Path(sys.executable).parent / "ha-agent-old.exe"
+    try:
+        if old.exists():
+            old.unlink()
+            logging.info("cleaned up leftover old exe")
+    except Exception as exc:
+        logging.warning("could not remove old exe: %s", exc)
 
 
 # ── Setup wizard ──────────────────────────────────────────────────────────────
@@ -507,6 +553,7 @@ class TrayApp:
             APP_NAME,
             self._build_menu(),
         )
+        threading.Thread(target=self._check_update_bg, daemon=True).start()
         self._icon.run()
 
     # ── tray menu actions ─────────────────────────────────────────────────────
@@ -515,6 +562,7 @@ class TrayApp:
         return pystray.Menu(
             pystray.MenuItem("Status", self._show_status),
             pystray.MenuItem("Settings…", self._open_settings),
+            pystray.MenuItem("Check for updates", self._check_update_manual),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", self._exit),
         )
@@ -538,6 +586,54 @@ class TrayApp:
             target=lambda: SetupDialog(self._config, on_save).run(), daemon=True
         ).start()
 
+    def _check_update_bg(self) -> None:
+        time.sleep(5)  # let the icon finish initialising before we show any notification
+        self._run_update_check(manual=False)
+
+    def _check_update_manual(self, icon, item) -> None:
+        threading.Thread(
+            target=lambda: self._run_update_check(manual=True), daemon=True
+        ).start()
+
+    def _run_update_check(self, manual: bool = False) -> None:
+        result = check_for_update()
+        if result:
+            new_version, download_url = result
+            self._show_notification(APP_NAME, f"Update v{new_version} found, downloading…")
+            self._do_update(new_version, download_url)
+        elif manual:
+            self._show_notification(APP_NAME, f"Already on the latest version ({VERSION}).")
+
+    def _do_update(self, new_version: str, download_url: str) -> None:
+        if not getattr(sys, "frozen", False):
+            logging.info("running as script — skipping self-replace for v%s", new_version)
+            return
+        try:
+            exe_path = Path(sys.executable)
+            tmp_path = exe_path.parent / "ha-agent-new.exe"
+
+            logging.info("downloading v%s from %s", new_version, download_url)
+            urllib.request.urlretrieve(download_url, str(tmp_path))
+
+            self._show_notification(APP_NAME, f"v{new_version} ready — restarting…")
+            time.sleep(2)
+
+            self._agent.stop()
+
+            # Windows lets you rename a running .exe; swap new into place then restart.
+            old_path = exe_path.parent / "ha-agent-old.exe"
+            if old_path.exists():
+                old_path.unlink()
+            exe_path.rename(old_path)
+            tmp_path.rename(exe_path)
+
+            subprocess.Popen([str(exe_path)])
+            if self._icon:
+                self._icon.stop()
+        except Exception as exc:
+            logging.error("update failed: %s", exc)
+            self._show_notification(APP_NAME, f"Update failed: {exc}")
+
     def _exit(self, icon, item) -> None:
         self._agent.stop()
         icon.stop()
@@ -552,6 +648,8 @@ def main() -> None:
         format="%(asctime)s  %(levelname)-8s  %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    cleanup_old_exe()
 
     parser = argparse.ArgumentParser(description=APP_NAME)
     parser.add_argument("--setup", action="store_true", help="Open settings dialog")

@@ -22,6 +22,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller
 
+      - name: Patch version into source
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          # For branch pushes ref_name is the branch name; use 0.0.0 as dev sentinel.
+          if ($tag -match '^v\d') {
+            $version = $tag.TrimStart('v')
+          } else {
+            $version = "0.0.0"
+          }
+          (Get-Content ha_agent.py -Raw) `
+            -replace 'VERSION = ".*?"', "VERSION = `"$version`"" |
+            Set-Content ha_agent.py
+          Write-Host "Version set to $version"
+
       - name: Build exe
         run: >
           pyinstaller
