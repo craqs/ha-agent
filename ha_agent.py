@@ -5,6 +5,7 @@ Exposes to Home Assistant via MQTT auto-discovery:
   • binary_sensor: camera currently in use
   • binary_sensor: microphone currently in use
   • device_tracker: PC online / offline
+  • notify: receive desktop toast notifications from HA
 
 Run with no arguments to start (shows setup wizard on first run).
 Flags: --setup  open settings dialog
@@ -42,6 +43,7 @@ AVAIL_TOPIC = f"ha_agent/{HOSTNAME}/availability"
 CAMERA_TOPIC = f"ha_agent/{HOSTNAME}/camera"
 MIC_TOPIC = f"ha_agent/{HOSTNAME}/microphone"
 STATUS_TOPIC = f"ha_agent/{HOSTNAME}/status"
+NOTIFY_TOPIC = f"ha_agent/{HOSTNAME}/notify"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -353,12 +355,22 @@ _DISCOVERY_CONFIGS: list[tuple[str, dict]] = [
             "source_type": "router",
         },
     ),
+    (
+        f"homeassistant/notify/ha_agent_{HOSTNAME}/config",
+        {
+            **_AVAIL_FRAGMENT,
+            "name": f"{HOSTNAME} Notify",
+            "unique_id": f"{HOSTNAME}_notify",
+            "command_topic": NOTIFY_TOPIC,
+        },
+    ),
 ]
 
 
 class MQTTAgent:
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, notify_callback=None) -> None:
         self._config = config
+        self._notify_callback = notify_callback  # callable(title, message)
         self._camera: bool | None = None
         self._mic: bool | None = None
         self._connected = False
@@ -377,6 +389,7 @@ class MQTTAgent:
         client.will_set(AVAIL_TOPIC, "offline", retain=True)
         client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
+        client.on_message = self._on_message
         client.reconnect_delay_set(min_delay=5, max_delay=60)
         self._client = client
 
@@ -421,6 +434,7 @@ class MQTTAgent:
             self._publish_discovery()
             client.publish(AVAIL_TOPIC, "online", retain=True)
             client.publish(STATUS_TOPIC, "home")
+            client.subscribe(NOTIFY_TOPIC)
         else:
             logging.error("MQTT connection refused (rc=%d)", rc)
 
@@ -428,6 +442,20 @@ class MQTTAgent:
         self._connected = False
         if rc != 0:
             logging.warning("MQTT disconnected unexpectedly (rc=%d)", rc)
+
+    def _on_message(self, client, userdata, msg) -> None:
+        if msg.topic != NOTIFY_TOPIC or not self._notify_callback:
+            return
+        try:
+            payload = json.loads(msg.payload.decode())
+        except Exception:
+            logging.warning("notify: could not parse payload: %r", msg.payload)
+            return
+        title = str(payload.get("title", APP_NAME))
+        message = str(payload.get("message", ""))
+        if message:
+            logging.info("notify: %s — %s", title, message)
+            self._notify_callback(title, message)
 
     def _publish_discovery(self) -> None:
         for topic, payload in _DISCOVERY_CONFIGS:
@@ -468,8 +496,8 @@ def _make_tray_icon(connected: bool = True) -> Image.Image:
 class TrayApp:
     def __init__(self, config: dict) -> None:
         self._config = config
-        self._agent = MQTTAgent(config)
         self._icon: pystray.Icon | None = None
+        self._agent = MQTTAgent(config, notify_callback=self._show_notification)
 
     def run(self) -> None:
         self._agent.start()
@@ -495,11 +523,15 @@ class TrayApp:
         import ctypes
         ctypes.windll.user32.MessageBoxW(0, self._agent.status_text, APP_NAME, 0x40)
 
+    def _show_notification(self, title: str, message: str) -> None:
+        if self._icon:
+            self._icon.notify(message, title)
+
     def _open_settings(self, icon, item) -> None:
         def on_save(new_config: dict) -> None:
             self._config = new_config
             self._agent.stop()
-            self._agent = MQTTAgent(new_config)
+            self._agent = MQTTAgent(new_config, notify_callback=self._show_notification)
             self._agent.start()
 
         threading.Thread(

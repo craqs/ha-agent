@@ -9,6 +9,7 @@ A lightweight Windows tray app that exposes your PC's state to **Home Assistant*
 | Camera Active | `binary_sensor` | `ON` while any app is using the webcam |
 | Microphone Active | `binary_sensor` | `ON` while any app is using the mic |
 | `<hostname>` PC | `device_tracker` | `home` while the PC is on, `not_home` after shutdown |
+| `<hostname>` Notify | `notify` | Send desktop toast notifications from HA automations |
 
 All entities group under a single HA device named after your PC's hostname.
 
@@ -47,6 +48,30 @@ pyinstaller --onefile --windowed --name ha-agent ha_agent.py
 ```
 
 Or push a `v*` tag to GitHub — Actions builds the `.exe` automatically on a Windows runner and attaches it to a release.
+
+## Sending notifications from HA
+
+After the agent connects, a `notify.<hostname>_notify` service appears in Home Assistant.
+Use it in automations or the Developer Tools → Services panel:
+
+```yaml
+action:
+  - service: notify.desktop_abc_notify
+    data:
+      title: "Motion detected"
+      message: "Front door camera triggered"
+```
+
+The notification appears as a balloon from the system tray icon.
+
+> **Note:** MQTT notify entity discovery requires Home Assistant 2024.x or later.
+> On older versions, add this to `configuration.yaml` manually:
+> ```yaml
+> notify:
+>   - platform: mqtt
+>     name: "Desktop ABC Notify"
+>     command_topic: "ha_agent/DESKTOP-ABC/notify"
+> ```
 
 ## How camera/mic detection works
 
