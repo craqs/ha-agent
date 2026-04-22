@@ -447,7 +447,6 @@ _DISCOVERY_CONFIGS: list[tuple[str, dict]] = [
             "name": "Notify",
             "unique_id": f"{HOSTNAME}_notify",
             "command_topic": NOTIFY_TOPIC,
-            "command_template": '{{ {"title": title, "message": message} | to_json }}',
         },
     ),
     (
