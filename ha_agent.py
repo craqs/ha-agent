@@ -15,6 +15,7 @@ Flags: --setup  open settings dialog
 import argparse
 import json
 import logging
+import logging.handlers
 import os
 import shutil
 import socket
@@ -61,6 +62,7 @@ UPDATE_CHECK_TOPIC = f"ha_agent/{HOSTNAME}/update/check"    # receives "check" t
 
 CONFIG_DIR = Path(os.environ.get("APPDATA", ".")) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
+LOG_FILE = CONFIG_DIR / "ha-agent.log"
 
 DEFAULT_CONFIG: dict = {
     "mqtt_host": "",
@@ -704,6 +706,7 @@ class TrayApp:
     def _build_menu(self) -> pystray.Menu:
         return pystray.Menu(
             pystray.MenuItem("Status", self._show_status),
+            pystray.MenuItem("Open log", self._open_log),
             pystray.MenuItem("Settings…", self._open_settings),
             pystray.MenuItem("Check for updates", self._check_update_manual),
             pystray.Menu.SEPARATOR,
@@ -722,6 +725,13 @@ class TrayApp:
     def _do_show_status(self) -> None:
         import ctypes
         ctypes.windll.user32.MessageBoxW(0, self._agent.status_text, APP_NAME, 0x40)
+
+    def _open_log(self, icon, item) -> None:
+        try:
+            os.startfile(LOG_FILE)
+        except OSError as exc:
+            logging.warning("could not open log: %s", exc)
+            self._show_notification(APP_NAME, f"Could not open log: {exc}")
 
     def _show_notification(self, title: str, message: str) -> None:
         if self._icon:
@@ -839,12 +849,42 @@ class TrayApp:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
-def main() -> None:
+def setup_logging() -> None:
+    """Log to a size-capped file in CONFIG_DIR, plus the console when there is one.
+    The release exe is built --windowed, so sys.stderr is None there and a plain
+    basicConfig() would throw every log line away."""
+    handlers: list[logging.Handler] = []
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8",
+        ))
+    except OSError:
+        pass  # no file logging beats not starting at all
+    if sys.stderr is not None:
+        handlers.append(logging.StreamHandler())
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(message)s",
-        datefmt="%H:%M:%S",
+        format="%(asctime)s  %(levelname)-8s  %(threadName)s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
     )
+
+    # Uncaught exceptions would otherwise vanish along with stderr.
+    def log_thread_exception(args) -> None:
+        if args.exc_type is not SystemExit:
+            logging.critical(
+                "uncaught exception in thread %s", args.thread.name if args.thread else "?",
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+
+    sys.excepthook = lambda *exc_info: logging.critical("uncaught exception", exc_info=exc_info)
+    threading.excepthook = log_thread_exception
+
+
+def main() -> None:
+    setup_logging()
+    logging.info("%s v%s starting (pid %d)", APP_NAME, VERSION, os.getpid())
 
     ensure_single_instance()
     cleanup_old_exe()
