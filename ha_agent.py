@@ -24,6 +24,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+import ssl
+import certifi
 import paho.mqtt.client as mqtt
 from PIL import Image, ImageDraw
 import pystray
@@ -219,7 +221,8 @@ def check_for_update() -> tuple[str, str] | None:
     Raises on network / API errors so callers can distinguish from 'already up to date'."""
     url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
     req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
         data = json.loads(resp.read())
     latest = data["tag_name"].lstrip("v")
     logging.info("update check: installed=%s latest=%s", VERSION, latest)
@@ -229,6 +232,37 @@ def check_for_update() -> tuple[str, str] | None:
                 return latest, asset["browser_download_url"]
         raise RuntimeError(f"v{latest} has no .exe asset on the release")
     return None
+
+
+def ensure_single_instance() -> None:
+    """Kill any other ha-agent.exe process already running on this machine."""
+    if not getattr(sys, "frozen", False):
+        return  # running as script — skip
+    my_pid = os.getpid()
+    killed = False
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq ha-agent.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().splitlines():
+            parts = [p.strip('"') for p in line.split('","')]
+            if len(parts) >= 2:
+                try:
+                    pid = int(parts[1])
+                    if pid != my_pid:
+                        subprocess.run(
+                            ["taskkill", "/F", "/PID", str(pid)],
+                            capture_output=True, timeout=5,
+                        )
+                        logging.info("killed previous ha-agent instance (PID %d)", pid)
+                        killed = True
+                except ValueError:
+                    pass
+    except Exception as exc:
+        logging.warning("single-instance check failed: %s", exc)
+    if killed:
+        time.sleep(0.5)  # let killed process release MQTT/tray resources
 
 
 def cleanup_old_exe() -> None:
@@ -457,11 +491,12 @@ _DISCOVERY_CONFIGS: list[tuple[str, dict]] = [
 
 
 class MQTTAgent:
-    def __init__(self, config: dict, notify_callback=None, install_callback=None, check_callback=None) -> None:
+    def __init__(self, config: dict, notify_callback=None, install_callback=None, check_callback=None, status_callback=None) -> None:
         self._config = config
         self._notify_callback = notify_callback    # callable(title, message)
         self._install_callback = install_callback  # callable() — HA pressed Install
         self._check_callback = check_callback      # callable() — HA pressed Check for Update
+        self._status_callback = status_callback    # callable(connected: bool)
         self._camera: bool | None = None
         self._mic: bool | None = None
         self._connected = False
@@ -488,21 +523,20 @@ class MQTTAgent:
             )
         client.will_set(AVAIL_TOPIC, "offline", retain=True)
         client.on_connect = self._on_connect
+        client.on_connect_fail = self._on_connect_fail
         client.on_disconnect = self._on_disconnect
         client.on_message = self._on_message
         client.reconnect_delay_set(min_delay=5, max_delay=60)
         self._client = client
 
-        try:
-            client.connect(
-                self._config["mqtt_host"],
-                int(self._config.get("mqtt_port", 1883)),
-                keepalive=60,
-            )
-        except Exception as exc:
-            logging.error("MQTT connect failed: %s", exc)
-            return
-
+        # connect_async + loop_start: the network thread keeps retrying the first
+        # connection with the backoff above (5 s doubling to 60 s). A blocking
+        # connect() here failed for good when the PC booted before Wi-Fi/DNS was up.
+        client.connect_async(
+            self._config["mqtt_host"],
+            int(self._config.get("mqtt_port", 1883)),
+            keepalive=60,
+        )
         client.loop_start()
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
@@ -530,6 +564,8 @@ class MQTTAgent:
     def _on_connect(self, client, userdata, flags, rc) -> None:
         if rc == 0:
             self._connected = True
+            if self._status_callback:
+                self._status_callback(True)
             logging.info("MQTT connected to %s", self._config.get("mqtt_host"))
             self._publish_discovery()
             client.publish(AVAIL_TOPIC, "online", retain=True)
@@ -543,8 +579,13 @@ class MQTTAgent:
         else:
             logging.error("MQTT connection refused (rc=%d)", rc)
 
+    def _on_connect_fail(self, client, userdata) -> None:
+        logging.warning("MQTT connect to %s failed, retrying", self._config.get("mqtt_host"))
+
     def _on_disconnect(self, client, userdata, rc) -> None:
         self._connected = False
+        if self._status_callback:
+            self._status_callback(False)
         if rc != 0:
             logging.warning("MQTT disconnected unexpectedly (rc=%d)", rc)
 
@@ -555,7 +596,7 @@ class MQTTAgent:
                 # HA notify.send_message publishes a plain string; direct mqtt.publish may
                 # send JSON — handle both gracefully.
                 payload = json.loads(raw)
-                title = str(payload.get("title", APP_NAME))
+                title = str(payload.get("title") or APP_NAME)
                 message = str(payload.get("message", raw))
             except (json.JSONDecodeError, AttributeError):
                 title = APP_NAME
@@ -606,10 +647,25 @@ class MQTTAgent:
 # ── System tray ───────────────────────────────────────────────────────────────
 
 
-def _make_tray_icon(connected: bool = True) -> Image.Image:
-    color = (34, 139, 34) if connected else (180, 40, 40)
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    ImageDraw.Draw(img).ellipse((4, 4, 60, 60), fill=color)
+def _make_tray_icon(connected: bool) -> Image.Image:
+    SIZE = 64
+    HA_BLUE = (24, 188, 242)
+    img = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    # HA-blue background circle
+    d.ellipse((0, 0, SIZE - 1, SIZE - 1), fill=HA_BLUE)
+
+    # House silhouette (white), shifted slightly upper-left so dot fits bottom-right
+    d.polygon([(28, 10), (8, 30), (48, 30)], fill="white")   # roof
+    d.rectangle([14, 28, 42, 46], fill="white")               # body
+    d.rectangle([24, 36, 32, 46], fill=HA_BLUE)               # door cutout
+
+    # Status dot — green = connected, red = disconnected
+    dot_color = (34, 197, 94) if connected else (239, 68, 68)
+    d.ellipse((40, 40, 62, 62), fill="white")   # white ring
+    d.ellipse((43, 43, 59, 59), fill=dot_color)
+
     return img
 
 
@@ -623,13 +679,14 @@ class TrayApp:
             notify_callback=self._show_notification,
             install_callback=self._handle_ha_install,
             check_callback=lambda: self._run_update_check(manual=True),
+            status_callback=self._on_connection_status,
         )
 
     def run(self) -> None:
         self._agent.start()
         self._icon = pystray.Icon(
             APP_NAME,
-            _make_tray_icon(),
+            _make_tray_icon(connected=False),
             APP_NAME,
             self._build_menu(),
         )
@@ -647,7 +704,16 @@ class TrayApp:
             pystray.MenuItem("Exit", self._exit),
         )
 
+    def _on_connection_status(self, connected: bool) -> None:
+        if self._icon:
+            self._icon.icon = _make_tray_icon(connected)
+
     def _show_status(self, icon, item) -> None:
+        # Run in its own thread — calling MessageBoxW from pystray's Win32 callback
+        # can prevent the window from receiving input focus.
+        threading.Thread(target=self._do_show_status, daemon=True).start()
+
+    def _do_show_status(self) -> None:
         import ctypes
         ctypes.windll.user32.MessageBoxW(0, self._agent.status_text, APP_NAME, 0x40)
 
@@ -664,6 +730,7 @@ class TrayApp:
                 notify_callback=self._show_notification,
                 install_callback=self._handle_ha_install,
                 check_callback=lambda: self._run_update_check(manual=True),
+                status_callback=self._on_connection_status,
             )
             self._agent.start()
 
@@ -673,21 +740,26 @@ class TrayApp:
 
     def _check_update_bg(self) -> None:
         time.sleep(5)  # let the icon finish initialising before we show any notification
-        self._run_update_check(manual=False)
+        # At boot the network may not be up yet; retry until one check gets through.
+        delay = 30
+        while not self._run_update_check(manual=False):
+            time.sleep(delay)
+            delay = min(delay * 2, 3600)
 
     def _check_update_manual(self, icon, item) -> None:
         threading.Thread(
             target=lambda: self._run_update_check(manual=True), daemon=True
         ).start()
 
-    def _run_update_check(self, manual: bool = False) -> None:
+    def _run_update_check(self, manual: bool = False) -> bool:
+        """Returns False if the check failed (e.g. network not up yet), True once it completed."""
         try:
             result = check_for_update()
         except Exception as exc:
             logging.warning("update check failed: %s", exc)
             if manual:
                 self._show_notification(APP_NAME, f"Update check failed: {exc}")
-            return
+            return False
         if result:
             new_version, download_url = result
             self._pending_update = result
@@ -699,6 +771,7 @@ class TrayApp:
             self._agent.publish_update_status(VERSION, available=False)
             if manual:
                 self._show_notification(APP_NAME, f"Already on the latest version ({VERSION}).")
+        return True
 
     def _handle_ha_install(self) -> None:
         if self._pending_update:
@@ -760,6 +833,7 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
+    ensure_single_instance()
     cleanup_old_exe()
 
     parser = argparse.ArgumentParser(description=APP_NAME)

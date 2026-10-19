@@ -3,3 +3,4 @@ zeroconf>=0.131.0
 pystray>=0.19.5
 Pillow>=10.0.0
 pywin32>=306
+certifi>=2024.1.1

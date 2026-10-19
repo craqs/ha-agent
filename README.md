@@ -16,10 +16,10 @@ All entities group under a single HA device named after your PC's hostname.
 ## Installation
 
 1. Download **ha-agent.exe** from the [latest release](../../releases/latest).
-2. Run it — a setup wizard opens on first launch.
+2. Run it - a setup wizard opens on first launch.
 3. Enter your MQTT broker address (or click **Auto-discover** to find it via mDNS), port, and credentials.
 4. Tick **Start automatically with Windows** if you want it to run at login.
-5. Click **Save & Connect** — the agent appears in the system tray and entities show up in HA within seconds.
+5. Click **Save & Connect** - the agent appears in the system tray and entities show up in HA within seconds.
 
 ## Requirements
 
@@ -47,7 +47,7 @@ pip install -r requirements.txt pyinstaller
 pyinstaller --onefile --windowed --name ha-agent ha_agent.py
 ```
 
-Or push a `v*` tag to GitHub — Actions builds the `.exe` automatically on a Windows runner and attaches it to a release.
+Or push a `v*` tag to GitHub - Actions builds the `.exe` automatically on a Windows runner and attaches it to a release.
 
 ## Sending notifications from HA
 
