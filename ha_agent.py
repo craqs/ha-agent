@@ -16,6 +16,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -216,13 +217,18 @@ def _version_newer(latest: str, current: str) -> bool:
         return False
 
 
+def _github_open(url: str, timeout: float):
+    """urlopen with certifi's CA bundle: the frozen exe can't rely on the Windows cert store."""
+    req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    return urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx)
+
+
 def check_for_update() -> tuple[str, str] | None:
     """Query GitHub releases API. Returns (version, download_url) if newer, else None.
     Raises on network / API errors so callers can distinguish from 'already up to date'."""
     url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-    req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
-    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-    with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
+    with _github_open(url, timeout=10) as resp:
         data = json.loads(resp.read())
     latest = data["tag_name"].lstrip("v")
     logging.info("update check: installed=%s latest=%s", VERSION, latest)
@@ -523,21 +529,20 @@ class MQTTAgent:
             )
         client.will_set(AVAIL_TOPIC, "offline", retain=True)
         client.on_connect = self._on_connect
+        client.on_connect_fail = self._on_connect_fail
         client.on_disconnect = self._on_disconnect
         client.on_message = self._on_message
         client.reconnect_delay_set(min_delay=5, max_delay=60)
         self._client = client
 
-        try:
-            client.connect(
-                self._config["mqtt_host"],
-                int(self._config.get("mqtt_port", 1883)),
-                keepalive=60,
-            )
-        except Exception as exc:
-            logging.error("MQTT connect failed: %s", exc)
-            return
-
+        # connect_async + loop_start: the network thread keeps retrying the first
+        # connection with the backoff above (5 s doubling to 60 s). A blocking
+        # connect() here failed for good when the PC booted before Wi-Fi/DNS was up.
+        client.connect_async(
+            self._config["mqtt_host"],
+            int(self._config.get("mqtt_port", 1883)),
+            keepalive=60,
+        )
         client.loop_start()
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
@@ -579,6 +584,9 @@ class MQTTAgent:
             client.subscribe(UPDATE_CHECK_TOPIC)
         else:
             logging.error("MQTT connection refused (rc=%d)", rc)
+
+    def _on_connect_fail(self, client, userdata) -> None:
+        logging.warning("MQTT connect to %s failed, retrying", self._config.get("mqtt_host"))
 
     def _on_disconnect(self, client, userdata, rc) -> None:
         self._connected = False
@@ -738,21 +746,26 @@ class TrayApp:
 
     def _check_update_bg(self) -> None:
         time.sleep(5)  # let the icon finish initialising before we show any notification
-        self._run_update_check(manual=False)
+        # At boot the network may not be up yet; retry until one check gets through.
+        delay = 30
+        while not self._run_update_check(manual=False):
+            time.sleep(delay)
+            delay = min(delay * 2, 3600)
 
     def _check_update_manual(self, icon, item) -> None:
         threading.Thread(
             target=lambda: self._run_update_check(manual=True), daemon=True
         ).start()
 
-    def _run_update_check(self, manual: bool = False) -> None:
+    def _run_update_check(self, manual: bool = False) -> bool:
+        """Returns False if the check failed (e.g. network not up yet), True once it completed."""
         try:
             result = check_for_update()
         except Exception as exc:
             logging.warning("update check failed: %s", exc)
             if manual:
                 self._show_notification(APP_NAME, f"Update check failed: {exc}")
-            return
+            return False
         if result:
             new_version, download_url = result
             self._pending_update = result
@@ -764,6 +777,7 @@ class TrayApp:
             self._agent.publish_update_status(VERSION, available=False)
             if manual:
                 self._show_notification(APP_NAME, f"Already on the latest version ({VERSION}).")
+        return True
 
     def _handle_ha_install(self) -> None:
         if self._pending_update:
@@ -783,7 +797,14 @@ class TrayApp:
             tmp_path = exe_path.parent / "ha-agent-new.exe"
 
             logging.info("downloading v%s from %s", new_version, download_url)
-            urllib.request.urlretrieve(download_url, str(tmp_path))
+            # timeout is per socket read, so a stalled download fails instead of hanging forever
+            with _github_open(download_url, timeout=60) as resp, open(tmp_path, "wb") as f:
+                expected = int(resp.headers.get("Content-Length") or -1)
+                shutil.copyfileobj(resp, f)
+                got = f.tell()
+            # urlopen accepts a short read silently; never swap a truncated exe into place
+            if expected >= 0 and got != expected:
+                raise RuntimeError(f"download incomplete ({got} of {expected} bytes)")
 
             self._show_notification(APP_NAME, f"v{new_version} ready — restarting…")
             time.sleep(2)
