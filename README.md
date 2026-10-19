@@ -31,6 +31,7 @@ All entities group under a single HA device named after your PC's hostname.
 | Item | Action |
 |------|--------|
 | Status | Shows current broker connection and sensor states |
+| Open log | Opens `%APPDATA%\HA-Agent\ha-agent.log` (1 MB, 3 rotated copies kept) |
 | Settings… | Re-opens the setup wizard |
 | Exit | Disconnects and removes the tray icon |
 
