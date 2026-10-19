@@ -16,6 +16,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -216,13 +217,18 @@ def _version_newer(latest: str, current: str) -> bool:
         return False
 
 
+def _github_open(url: str, timeout: float):
+    """urlopen with certifi's CA bundle: the frozen exe can't rely on the Windows cert store."""
+    req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    return urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx)
+
+
 def check_for_update() -> tuple[str, str] | None:
     """Query GitHub releases API. Returns (version, download_url) if newer, else None.
     Raises on network / API errors so callers can distinguish from 'already up to date'."""
     url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-    req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
-    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-    with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
+    with _github_open(url, timeout=10) as resp:
         data = json.loads(resp.read())
     latest = data["tag_name"].lstrip("v")
     logging.info("update check: installed=%s latest=%s", VERSION, latest)
@@ -791,7 +797,14 @@ class TrayApp:
             tmp_path = exe_path.parent / "ha-agent-new.exe"
 
             logging.info("downloading v%s from %s", new_version, download_url)
-            urllib.request.urlretrieve(download_url, str(tmp_path))
+            # timeout is per socket read, so a stalled download fails instead of hanging forever
+            with _github_open(download_url, timeout=60) as resp, open(tmp_path, "wb") as f:
+                expected = int(resp.headers.get("Content-Length") or -1)
+                shutil.copyfileobj(resp, f)
+                got = f.tell()
+            # urlopen accepts a short read silently; never swap a truncated exe into place
+            if expected >= 0 and got != expected:
+                raise RuntimeError(f"download incomplete ({got} of {expected} bytes)")
 
             self._show_notification(APP_NAME, f"v{new_version} ready — restarting…")
             time.sleep(2)
